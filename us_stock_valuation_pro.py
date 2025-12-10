@@ -7,7 +7,6 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 import time
 import random
-import requests
 from functools import wraps
 from io import BytesIO
 from reportlab.lib.pagesizes import A4
@@ -17,7 +16,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 
-# Configure yfinance settings
+# Suppress warnings
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -1216,22 +1215,8 @@ if 'stock_cache' not in st.session_state:
 if 'last_request_time' not in st.session_state:
     st.session_state.last_request_time = 0
 
-# Create a session with custom headers to avoid rate limiting
-def create_yf_session():
-    """Create a requests session with browser-like headers"""
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-    })
-    return session
-
 def fetch_stock_data_direct(ticker):
-    """Fetch stock data using yfinance with custom session"""
+    """Fetch stock data using yfinance with rate limit handling"""
     try:
         # Ensure minimum delay between requests (3-6 seconds random)
         current_time = time.time()
@@ -1243,17 +1228,11 @@ def fetch_stock_data_direct(ticker):
         
         st.session_state.last_request_time = time.time()
         
-        # Create ticker with custom session
-        session = create_yf_session()
-        stock = yf.Ticker(ticker, session=session)
+        # Create ticker - use default session (no custom session)
+        stock = yf.Ticker(ticker)
         
         # Try to get info
         info = stock.info
-        
-        if not info or len(info) < 5:
-            # Try without custom session as fallback
-            stock = yf.Ticker(ticker)
-            info = stock.info
             
         if not info or len(info) < 5:
             return None, "Unable to fetch data - ticker may be invalid"
