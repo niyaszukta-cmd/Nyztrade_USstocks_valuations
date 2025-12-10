@@ -1244,9 +1244,11 @@ def fetch_stock_data_direct(ticker):
             
         return info, None
         
-    except Exception as e:
+   except Exception as e:
         error_msg = str(e).lower()
         if "429" in str(e) or "rate" in error_msg or "too many" in error_msg or "limited" in error_msg:
+            return None, "RATE_LIMIT"
+        if "expecting value" in error_msg or "jsondecodeerror" in error_msg:
             return None, "RATE_LIMIT"
         if "no data" in error_msg or "not found" in error_msg or "404" in str(e):
             return None, f"Ticker '{ticker}' not found"
