@@ -6,6 +6,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 import time
+import random
+import requests
 from functools import wraps
 from io import BytesIO
 from reportlab.lib.pagesizes import A4
@@ -14,6 +16,10 @@ from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
+
+# Configure yfinance settings
+import warnings
+warnings.filterwarnings('ignore')
 
 st.set_page_config(
     page_title="US Stock Valuation Pro", 
@@ -1185,7 +1191,6 @@ if __name__ == "__main__":
         count = len(US_STOCKS[cat])
         print(f"  {cat}: {count} stocks")
     print("=" * 70)
-
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
@@ -1208,44 +1213,85 @@ def retry_with_backoff(retries=5, backoff_in_seconds=3):
 # Session-level cache to avoid repeated calls
 if 'stock_cache' not in st.session_state:
     st.session_state.stock_cache = {}
+if 'last_request_time' not in st.session_state:
+    st.session_state.last_request_time = 0
 
-@st.cache_data(ttl=14400, show_spinner=False)  # 4-hour cache
-def fetch_stock_data(ticker):
-    """Fetch stock data with improved rate limit handling"""
+# Create a session with custom headers to avoid rate limiting
+def create_yf_session():
+    """Create a requests session with browser-like headers"""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    })
+    return session
+
+def fetch_stock_data_direct(ticker):
+    """Fetch stock data using yfinance with custom session"""
     try:
-        # Random delay to avoid rate limits (2-4 seconds)
-        delay = 2 + (hash(ticker) % 3)
-        time.sleep(delay)
+        # Ensure minimum delay between requests (3-6 seconds random)
+        current_time = time.time()
+        time_since_last = current_time - st.session_state.last_request_time
+        min_delay = 3 + random.random() * 3  # 3-6 seconds
         
-        stock = yf.Ticker(ticker)
+        if time_since_last < min_delay:
+            time.sleep(min_delay - time_since_last)
+        
+        st.session_state.last_request_time = time.time()
+        
+        # Create ticker with custom session
+        session = create_yf_session()
+        stock = yf.Ticker(ticker, session=session)
+        
+        # Try to get info
         info = stock.info
         
         if not info or len(info) < 5:
-            return None, "Unable to fetch data"
+            # Try without custom session as fallback
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            
+        if not info or len(info) < 5:
+            return None, "Unable to fetch data - ticker may be invalid"
         
         # Check if we got valid data
-        price = info.get('currentPrice', 0) or info.get('regularMarketPrice', 0)
+        price = info.get('currentPrice', 0) or info.get('regularMarketPrice', 0) or info.get('previousClose', 0)
         if not price or price <= 0:
-            return None, "No price data available"
+            return None, "No price data available for this ticker"
             
         return info, None
+        
     except Exception as e:
         error_msg = str(e).lower()
-        if "429" in str(e) or "rate" in error_msg or "too many" in error_msg:
-            return None, "Rate limit reached. Please wait 1-2 minutes and try again."
-        if "no data" in error_msg or "not found" in error_msg:
+        if "429" in str(e) or "rate" in error_msg or "too many" in error_msg or "limited" in error_msg:
+            return None, "RATE_LIMIT"
+        if "no data" in error_msg or "not found" in error_msg or "404" in str(e):
             return None, f"Ticker '{ticker}' not found"
-        return None, f"Error: {str(e)[:80]}"
+        if "connection" in error_msg or "timeout" in error_msg:
+            return None, "Connection error - please try again"
+        return None, f"Error: {str(e)[:60]}"
+
+@st.cache_data(ttl=21600, show_spinner=False)  # 6-hour cache
+def fetch_stock_cached(ticker):
+    """Cached version of stock fetch"""
+    return fetch_stock_data_direct(ticker)
 
 def fetch_with_session_cache(ticker):
-    """Wrapper that uses session cache first"""
-    # Check session cache first
-    cache_key = f"{ticker}_{datetime.now().strftime('%Y%m%d%H')}"
-    if cache_key in st.session_state.stock_cache:
-        return st.session_state.stock_cache[cache_key]
+    """Wrapper that uses session cache first, then disk cache"""
+    # Check session cache first (valid for current session)
+    cache_key = f"{ticker}_{datetime.now().strftime('%Y%m%d')}"
     
-    # Fetch from API
-    result = fetch_stock_data(ticker)
+    if cache_key in st.session_state.stock_cache:
+        cached_data = st.session_state.stock_cache[cache_key]
+        if cached_data[0] is not None:  # Only return if we have valid data
+            return cached_data
+    
+    # Try cached fetch
+    result = fetch_stock_cached(ticker)
     
     # Store in session cache if successful
     if result[0] is not None:
@@ -1777,30 +1823,38 @@ if 'analyze' in st.session_state and st.session_state.analyze:
     t = st.session_state.analyze
     
     # Fetch data with progress and rate limit awareness
-    with st.spinner(f"🔄 Fetching data for {t}... Please wait"):
+    with st.spinner(f"🔄 Fetching data for {t}... This may take a few seconds"):
         info, error = fetch_with_session_cache(t)
     
     if error or not info:
-        st.error(f"❌ Error: {error if error else 'Failed to fetch stock data'}")
-        
-        if "rate limit" in str(error).lower():
+        if error == "RATE_LIMIT":
+            st.error("⏳ Yahoo Finance Rate Limit - Please wait and retry")
             st.markdown('''
             <div class="warning-box">
                 <strong>⏳ Rate Limit Reached</strong><br>
-                Yahoo Finance has temporarily limited requests. This is normal.<br><br>
-                <strong>What to do:</strong><br>
-                • Wait 1-2 minutes before trying again<br>
-                • The app caches data for 4 hours, so subsequent requests will be faster<br>
-                • Try a different stock in the meantime
+                Yahoo Finance has temporarily limited requests from this server.<br><br>
+                <strong>Solutions:</strong><br>
+                • Click the <strong>Retry</strong> button below after waiting 30-60 seconds<br>
+                • The app caches successful requests for 6 hours<br>
+                • Try during off-peak hours (early morning US time)
             </div>
             ''', unsafe_allow_html=True)
+            
+            col1, col2, col3 = st.columns([1, 1, 1])
+            with col2:
+                if st.button("🔄 Retry Now", use_container_width=True, type="primary"):
+                    # Clear the cache for this ticker and retry
+                    st.cache_data.clear()
+                    st.rerun()
         else:
+            st.error(f"❌ Error: {error}")
             st.markdown('''
             <div class="warning-box">
                 <strong>Troubleshooting Tips:</strong><br>
                 • Verify the ticker symbol is correct (e.g., AAPL, MSFT, GOOGL)<br>
+                • Some tickers like BRK-B may need special formatting (try BRK-B or BRK.B)<br>
                 • Check your internet connection<br>
-                • Try again in a few moments (API rate limits may apply)
+                • Try again in a few moments
             </div>
             ''', unsafe_allow_html=True)
         st.stop()
