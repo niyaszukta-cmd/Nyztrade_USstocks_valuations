@@ -1205,21 +1205,53 @@ def retry_with_backoff(retries=5, backoff_in_seconds=3):
         return wrapper
     return decorator
 
-@st.cache_data(ttl=7200)
-@retry_with_backoff(retries=5, backoff_in_seconds=3)
+# Session-level cache to avoid repeated calls
+if 'stock_cache' not in st.session_state:
+    st.session_state.stock_cache = {}
+
+@st.cache_data(ttl=14400, show_spinner=False)  # 4-hour cache
 def fetch_stock_data(ticker):
+    """Fetch stock data with improved rate limit handling"""
     try:
-        time.sleep(1)
+        # Random delay to avoid rate limits (2-4 seconds)
+        delay = 2 + (hash(ticker) % 3)
+        time.sleep(delay)
+        
         stock = yf.Ticker(ticker)
         info = stock.info
+        
         if not info or len(info) < 5:
             return None, "Unable to fetch data"
+        
+        # Check if we got valid data
+        price = info.get('currentPrice', 0) or info.get('regularMarketPrice', 0)
+        if not price or price <= 0:
+            return None, "No price data available"
+            
         return info, None
     except Exception as e:
-        error_msg = str(e)
-        if "429" in error_msg or "rate" in error_msg.lower():
-            return None, "Rate limit reached"
-        return None, str(e)[:100]
+        error_msg = str(e).lower()
+        if "429" in str(e) or "rate" in error_msg or "too many" in error_msg:
+            return None, "Rate limit reached. Please wait 1-2 minutes and try again."
+        if "no data" in error_msg or "not found" in error_msg:
+            return None, f"Ticker '{ticker}' not found"
+        return None, f"Error: {str(e)[:80]}"
+
+def fetch_with_session_cache(ticker):
+    """Wrapper that uses session cache first"""
+    # Check session cache first
+    cache_key = f"{ticker}_{datetime.now().strftime('%Y%m%d%H')}"
+    if cache_key in st.session_state.stock_cache:
+        return st.session_state.stock_cache[cache_key]
+    
+    # Fetch from API
+    result = fetch_stock_data(ticker)
+    
+    # Store in session cache if successful
+    if result[0] is not None:
+        st.session_state.stock_cache[cache_key] = result
+    
+    return result
 
 def calculate_valuations(info):
     try:
@@ -1725,6 +1757,17 @@ with st.sidebar:
     # Analyze button
     st.markdown("---")
     analyze_clicked = st.button("🚀 ANALYZE STOCK", use_container_width=True, type="primary")
+    
+    # Rate limit info
+    st.markdown("---")
+    st.markdown("""
+    <div style='background: rgba(255,255,255,0.1); padding: 0.8rem; border-radius: 8px; font-size: 0.75rem;'>
+        <strong>💡 Tips:</strong><br>
+        • Data is cached for 4 hours<br>
+        • Wait 1-2 min between requests<br>
+        • If rate limited, try again later
+    </div>
+    """, unsafe_allow_html=True)
 
 # Main content
 if analyze_clicked:
@@ -1733,20 +1776,33 @@ if analyze_clicked:
 if 'analyze' in st.session_state and st.session_state.analyze:
     t = st.session_state.analyze
     
-    # Fetch data with progress
-    with st.spinner(f"🔄 Fetching data for {t}..."):
-        info, error = fetch_stock_data(t)
+    # Fetch data with progress and rate limit awareness
+    with st.spinner(f"🔄 Fetching data for {t}... Please wait"):
+        info, error = fetch_with_session_cache(t)
     
     if error or not info:
         st.error(f"❌ Error: {error if error else 'Failed to fetch stock data'}")
-        st.markdown('''
-        <div class="warning-box">
-            <strong>Troubleshooting Tips:</strong><br>
-            • Verify the ticker symbol is correct (e.g., AAPL, MSFT, GOOGL)<br>
-            • Check your internet connection<br>
-            • Try again in a few moments (API rate limits may apply)
-        </div>
-        ''', unsafe_allow_html=True)
+        
+        if "rate limit" in str(error).lower():
+            st.markdown('''
+            <div class="warning-box">
+                <strong>⏳ Rate Limit Reached</strong><br>
+                Yahoo Finance has temporarily limited requests. This is normal.<br><br>
+                <strong>What to do:</strong><br>
+                • Wait 1-2 minutes before trying again<br>
+                • The app caches data for 4 hours, so subsequent requests will be faster<br>
+                • Try a different stock in the meantime
+            </div>
+            ''', unsafe_allow_html=True)
+        else:
+            st.markdown('''
+            <div class="warning-box">
+                <strong>Troubleshooting Tips:</strong><br>
+                • Verify the ticker symbol is correct (e.g., AAPL, MSFT, GOOGL)<br>
+                • Check your internet connection<br>
+                • Try again in a few moments (API rate limits may apply)
+            </div>
+            ''', unsafe_allow_html=True)
         st.stop()
     
     vals = calculate_valuations(info)
